@@ -126,3 +126,60 @@ def test_cross_process_identical_batches(app, sample_files):
         assert conn.execute("SELECT COUNT(*) c FROM instances").fetchone()["c"] == 4
     finally:
         conn.close()
+
+
+def test_cross_process_mixed_prefixes_converge(app, sample_files):
+    """不同前缀的 worker 并发首发同一原标识：必须全部采用同一份已提交映射。"""
+    data_dir = os.environ["DICOM_DATA_DIR"]
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    prefixes = ["1.2.826.0.7001", "1.2.826.0.7002", "1.2.826.0.7003"]
+    procs = [
+        ctx.Process(target=_worker,
+                    args=(data_dir, prefix, False, str(sample_files), queue))
+        for prefix in prefixes
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0
+    results = [(status, bid) for _, status, bid in
+               (queue.get() for _ in procs)]
+    assert all(status == "ready" for status, _ in results)
+
+    from app.db import get_db
+    conn = get_db()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM uid_mappings"
+        ).fetchone()["c"] == \
+            conn.execute(
+                "SELECT COUNT(*) c FROM (SELECT DISTINCT original_uid "
+                "FROM uid_mappings)"
+            ).fetchone()["c"]
+    finally:
+        conn.close()
+
+    # 每个 ready 批次的影像内 Study/Series/SOP 与清单、以及跨批次之间完全一致
+    client = app.test_client()
+    import io
+    import zipfile
+
+    import pydicom
+
+    seen: dict[str, tuple[str, str, str]] = {}
+    for _, bid in results:
+        resp = client.get(f"/batches/{bid}/download")
+        assert resp.status_code == 200
+        zf = zipfile.ZipFile(io.BytesIO(resp.data))
+        rows = zf.read("manifest.csv").decode("utf-8-sig").splitlines()[1:]
+        for line in rows:
+            cols = line.split(",")
+            new_study, new_series, new_sop = cols[4], cols[6], cols[8]
+            ds = pydicom.dcmread(io.BytesIO(zf.read(new_sop + ".dcm")))
+            assert str(ds.StudyInstanceUID) == new_study
+            assert str(ds.SeriesInstanceUID) == new_series
+            assert str(ds.SOPInstanceUID) == new_sop
+            prev = seen.setdefault(cols[7], (new_study, new_series, new_sop))
+            assert prev == (new_study, new_series, new_sop)

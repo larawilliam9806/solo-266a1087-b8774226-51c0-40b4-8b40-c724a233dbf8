@@ -310,6 +310,113 @@ def test_interrupted_batch_not_downloadable(app, client, sample_files, monkeypat
         db.close()
 
 
+# ---------------------------------------------------------------- 前缀变更后重启
+def _relaunch(prefix: str):
+    """模拟机构更换前缀后重启：同一数据目录，新建应用实例。"""
+    import os
+
+    from app.web import create_app
+
+    os.environ["DICOM_UID_PREFIX"] = prefix
+    return create_app().test_client()
+
+
+def _local_new_id(uid: str, prefix: str) -> str:
+    """按指定前缀从零派生（用于断言“新标识使用当前前缀”）。"""
+    from app import identifiers
+
+    return identifiers.derive_uid("sop", uid)
+
+
+def test_prefix_change_keeps_registered_mappings(client, sample_files, tmp_path):
+    paths = sorted(sample_files.glob("*.dcm"))
+    r1 = _batch_id_from_redirect(_upload_batch(client, paths))
+    z1 = _download_zip(client, r1)
+    m1 = {line.split(",")[7]: line.split(",")
+          for line in z1.read("manifest.csv").decode("utf-8-sig").splitlines()[1:]}
+
+    # 机构更换前缀并重启（同一数据目录）
+    client2 = _relaunch("1.2.826.0.4242")
+
+    # 已登记的同一 Study 影像：三类 UID 与 PatientID 全部沿用原新号
+    r2 = _batch_id_from_redirect(
+        _upload_batch(client2, [sample_files / "ct_001.dcm"]))
+    z2 = _download_zip(client2, r2)
+    m2 = {line.split(",")[7]: line.split(",")
+          for line in z2.read("manifest.csv").decode("utf-8-sig").splitlines()[1:]}
+    assert m2[gen.SOP_CT_1] == m1[gen.SOP_CT_1]
+    ct1_out = _read_member(z2, m2[gen.SOP_CT_1][8] + ".dcm")
+    assert str(ct1_out.StudyInstanceUID) == m1[gen.SOP_CT_1][4]
+    assert str(ct1_out.SeriesInstanceUID) == m1[gen.SOP_CT_1][6]
+    assert str(ct1_out.PatientID) == m1[gen.SOP_CT_1][2]
+
+    # 原批次下载仍可用
+    assert client2.get(f"/batches/{r1}/download").status_code == 200
+
+    # 同一 Study 下新出现一张 CT：患者/Study/Series 沿用，SOP 用当前前缀
+    new_ct = tmp_path / "new_ct_001.dcm"
+    ds = pydicom.dcmread(str(sample_files / "ct_001.dcm"))
+    ds.SOPInstanceUID = gen.SOP_CT_1[:-1] + "9"
+    ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+    ds.PixelData = bytes([0x11]) * len(ds.PixelData)
+    ds.save_as(str(new_ct), write_like_original=False)
+
+    r3 = _batch_id_from_redirect(
+        _upload_batch(client2, [new_ct, sample_files / "sr_001.dcm"]))
+    z3 = _download_zip(client2, r3)
+    m3 = {line.split(",")[7]: line.split(",")
+          for line in z3.read("manifest.csv").decode("utf-8-sig").splitlines()[1:]}
+    assert m3[ds.SOPInstanceUID][2] == m1[gen.SOP_CT_1][2]
+    assert m3[ds.SOPInstanceUID][4] == m1[gen.SOP_CT_1][4]
+    assert m3[ds.SOPInstanceUID][6] == m1[gen.SOP_CT_1][6]
+    assert m3[ds.SOPInstanceUID][8].startswith("1.2.826.0.4242.")
+    assert m3[ds.SOPInstanceUID][8] == _local_new_id(ds.SOPInstanceUID,
+                                                     "1.2.826.0.4242")
+    # SR 的嵌套引用与清单中的映射一致
+    sr_out = _read_member(z3, m3[gen.SOP_SR][8] + ".dcm")
+    assert str(sr_out.ReferencedStudySequence[0].ReferencedSOPInstanceUID) == \
+        m3[ds.SOPInstanceUID][4]
+    assert str(sr_out.ReferencedSeriesSequence[0].ReferencedImageSequence[0]
+               .ReferencedSOPInstanceUID) == m1[gen.SOP_CT_1][8]
+    assert str(sr_out.ReferencedSeriesSequence[0].SeriesInstanceUID) == \
+        m1[gen.SOP_CT_1][6]
+
+    # 再次重启（又一个新前缀）并重传：号不变
+    client3 = _relaunch("1.2.826.0.5151")
+    r4 = _batch_id_from_redirect(_upload_batch(client3, [new_ct]))
+    z4 = _download_zip(client3, r4)
+    m4 = {line.split(",")[7]: line.split(",")
+          for line in z4.read("manifest.csv").decode("utf-8-sig").splitlines()[1:]}
+    assert m4[ds.SOPInstanceUID] == m3[ds.SOPInstanceUID]
+
+
+# ---------------------------------------------------------------- 不一致即拒绝
+def test_unreconcilable_mapping_rejects_batch(client, sample_files):
+    from app.db import get_db
+
+    paths = sorted(sample_files.glob("*.dcm"))
+    r1 = _batch_id_from_redirect(_upload_batch(client, paths))
+    assert client.get(f"/batches/{r1}/download").status_code == 200
+
+    # 人为制造“已发布实例新号 ≠ 映射表”的不一致状态
+    db = get_db()
+    try:
+        db.execute(
+            "UPDATE instances SET new_sop_uid='1.2.826.0.4242.0.1' WHERE sop_uid=?",
+            (gen.SOP_CT_1,),
+        )
+    finally:
+        db.close()
+
+    r2 = _batch_id_from_redirect(
+        _upload_batch(client, [sample_files / "ct_001.dcm"]))
+    detail = client.get(f"/batches/{r2}")
+    assert b"failed" in detail.data
+    assert client.get(f"/batches/{r2}/download").status_code == 409
+    # 原有下载不受影响
+    assert client.get(f"/batches/{r1}/download").status_code == 200
+
+
 # ---------------------------------------------------------------- 空批次/非 DICOM
 def test_empty_upload_rejected(client):
     resp = client.post("/upload", data={}, content_type="multipart/form-data",

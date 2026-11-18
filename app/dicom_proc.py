@@ -38,6 +38,8 @@ TAG_PATIENT_NAME = Tag(0x0010, 0x0010)
 ROLE_HINT_TAGS: dict[Tag, str] = {
     Tag(0x0002, 0x0003): "sop",   # Media Storage SOP Instance UID（文件元信息同步）
     Tag(0x0008, 0x1155): "sop",   # Referenced SOP Instance UID
+    Tag(0x0020, 0x000D): "study",  # 嵌套序列中的 Study 引用
+    Tag(0x0020, 0x000E): "series",  # 嵌套序列中的 Series 引用
 }
 
 # 明确不换号的 UI 标签：类 UID、传输语法、帧参考 UID 等
@@ -155,6 +157,7 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
 
     plan = BatchPlan()
     seen_sop: dict[str, str] = {}       # 原 SOP UID -> sha256
+    instance_new_sops: dict[str, str] = {}  # 原 SOP UID -> 已发布实例的新 SOP UID
     conn = get_db()
     try:
         for orig_name, tmp_path in tmp_files:
@@ -187,6 +190,7 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
                     )
                 reused = True
                 object_relpath = row["object_path"]
+                instance_new_sops[sop_uid] = row["new_sop_uid"]
 
             pf = PlannedFile(
                 tmp_path=tmp_path,
@@ -228,29 +232,67 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
                         plan.value_roles[value] = hint
                     # 无提示且非身份的 UI（如 StorageMediaFileSetUID）保持原值
 
-        # 3) 与库内历史映射核对角色，防止跨批次角色漂移
+        # 3) 与库内历史映射核对角色，防止跨批次角色漂移；
+        #    已登记的映射是新号的唯一权威来源（即使当前前缀已变化）。
+        committed_uids: dict[str, str] = {}
         if plan.value_roles:
             placeholders = ",".join("?" * len(plan.value_roles))
             rows = conn.execute(
-                f"SELECT role, original_uid FROM uid_mappings "
+                f"SELECT role, original_uid, new_uid FROM uid_mappings "
                 f"WHERE original_uid IN ({placeholders})",
                 tuple(plan.value_roles),
             ).fetchall()
+            registered: dict[str, set[str]] = {}
             for row in rows:
-                wanted = plan.value_roles.get(row["original_uid"])
-                if wanted is not None and wanted != row["role"]:
+                registered.setdefault(row["original_uid"], set()).add(row["role"])
+                committed_uids.setdefault(row["original_uid"], row["new_uid"])
+            for original_uid, roles in registered.items():
+                if len(roles) > 1:
                     raise BatchRejected(
-                        f"UID {row['original_uid']} 历史角色为 {row['role']}，"
+                        f"UID {original_uid} 历史上被登记为多种角色 "
+                        f"{'/'.join(sorted(roles))}，无法一致完成，整批拒绝"
+                    )
+                wanted = plan.value_roles.get(original_uid)
+                if wanted is not None and wanted not in roles:
+                    raise BatchRejected(
+                        f"UID {original_uid} 历史角色为 {next(iter(roles))}，"
                         f"本批为 {wanted}，整批拒绝"
                     )
-                plan.value_roles[row["original_uid"]] = row["role"]
+                plan.value_roles[original_uid] = next(iter(roles))
 
-        # 4) 确定性派生全部新 UID 与新 PatientID
+        # 4) 解析新 UID：已登记沿用原新号；未登记才用当前前缀派生。
+        #    未登记值此时只是候选，persist_mappings 会在写事务内以首个提交值为准
+        #    回填 plan.uid_remap，保证并发 worker 最终使用同一份映射。
         for original_uid, role in plan.value_roles.items():
-            plan.uid_remap[original_uid] = identifiers.derive_uid(role, original_uid)
+            plan.uid_remap[original_uid] = committed_uids.get(
+                original_uid
+            ) or identifiers.derive_uid(role, original_uid)
+
+        # 已发布实例的新 SOP UID 同样必须原样沿用（对象文件已按该号落盘）。
+        # 仅当与“已提交映射”冲突时才拒绝（说明库内状态本身无法自洽）；
+        # 若映射行缺失，则以已发布实例为准，让 persist_mappings 补登记该值。
+        for orig_sop, published_new_sop in instance_new_sops.items():
+            committed = committed_uids.get(orig_sop)
+            if committed is not None and committed != published_new_sop:
+                raise BatchRejected(
+                    f"SOPInstanceUID {orig_sop} 的已发布新号 {published_new_sop} "
+                    f"与映射表 {committed} 不一致，整批拒绝"
+                )
+            plan.uid_remap[orig_sop] = published_new_sop
+
+        # PatientID 同样优先沿用已登记值（派生本身不含前缀，仍保留兜底）
         patient_ids = {f.patient_id for f in plan.files}
+        if patient_ids:
+            placeholders = ",".join("?" * len(patient_ids))
+            rows = conn.execute(
+                f"SELECT original_patient_id, new_patient_id FROM patient_mappings "
+                f"WHERE original_patient_id IN ({placeholders})",
+                tuple(patient_ids),
+            ).fetchall()
+            for row in rows:
+                plan.patient_remap[row["original_patient_id"]] = row["new_patient_id"]
         for pid in patient_ids:
-            plan.patient_remap[pid] = identifiers.derive_patient_id(pid)
+            plan.patient_remap.setdefault(pid, identifiers.derive_patient_id(pid))
         return plan
     finally:
         conn.close()
@@ -306,22 +348,66 @@ def _atomic_write_object(ds: pydicom.Dataset, object_relpath: str) -> Path:
 
 
 def persist_mappings(plan: BatchPlan) -> None:
-    """持久化 UID/患者映射（只插入不更新；确定性派生保证值恒定）。"""
+    """持久化 UID/患者映射，并把权威映射回填到 plan。
+
+    写事务（IMMEDIATE）内先插入候选值、再回读已提交值：并发 worker 对同一
+    原标识只有第一个提交者的新号生效，后到者必须改用这份已提交映射，从而
+    保证影像、嵌套引用与 CSV 清单引用同一套号码。若同一原标识已被登记为
+    不同角色，则无法一致完成，整批拒绝。
+    """
     conn = get_db()
     try:
         with immediate_tx(conn):
             for original_uid, role in plan.value_roles.items():
+                candidate = plan.uid_remap[original_uid]
+                rows = conn.execute(
+                    "SELECT role, new_uid FROM uid_mappings WHERE original_uid=?",
+                    (original_uid,),
+                ).fetchall()
+                if not rows:
+                    conn.execute(
+                        "INSERT INTO uid_mappings(role, original_uid, new_uid) "
+                        "VALUES(?,?,?)",
+                        (role, original_uid, candidate),
+                    )
+                    committed = candidate
+                else:
+                    if any(row["role"] != role for row in rows):
+                        raise BatchRejected(
+                            f"UID {original_uid} 已被并发批次登记为 "
+                            f"{'/'.join(sorted({r['role'] for r in rows}))}，"
+                            f"本批为 {role}，无法一致完成，整批拒绝"
+                        )
+                    values = {row["new_uid"] for row in rows}
+                    if len(values) > 1:
+                        raise BatchRejected(
+                            f"UID {original_uid} 存在多套已登记新号，无法一致完成，整批拒绝"
+                        )
+                    committed = values.pop()
+                plan.uid_remap[original_uid] = committed
+
+            for orig_pid in plan.patient_remap:
+                candidate = plan.patient_remap[orig_pid]
                 conn.execute(
-                    "INSERT OR IGNORE INTO uid_mappings(role, original_uid, new_uid) "
-                    "VALUES(?,?,?)",
-                    (role, original_uid, plan.uid_remap[original_uid]),
+                    "INSERT OR IGNORE INTO patient_mappings"
+                    "(original_patient_id, new_patient_id) VALUES(?,?)",
+                    (orig_pid, candidate),
                 )
-            for orig_pid, new_pid in plan.patient_remap.items():
-                conn.execute(
-                    "INSERT OR IGNORE INTO patient_mappings(original_patient_id, new_patient_id) "
-                    "VALUES(?,?)",
-                    (orig_pid, new_pid),
-                )
+                row = conn.execute(
+                    "SELECT new_patient_id FROM patient_mappings "
+                    "WHERE original_patient_id=?",
+                    (orig_pid,),
+                ).fetchone()
+                if row is None:
+                    raise BatchRejected(
+                        f"患者 {orig_pid} 的派生新 ID 与既有映射冲突，整批拒绝"
+                    )
+                if row["new_patient_id"] != candidate:
+                    raise BatchRejected(
+                        f"患者 {orig_pid} 的已登记新 ID {row['new_patient_id']} "
+                        f"与本批 {candidate} 不一致，无法一致完成，整批拒绝"
+                    )
+                plan.patient_remap[orig_pid] = row["new_patient_id"]
     finally:
         conn.close()
 
@@ -342,9 +428,10 @@ def process_plan(plan: BatchPlan, batch_id: str) -> None:
                 _atomic_write_object(pf.ds, pf.object_relpath)
             with immediate_tx(conn):
                 existing = conn.execute(
-                    "SELECT sha256 FROM instances WHERE sop_uid=?",
+                    "SELECT sha256, new_sop_uid FROM instances WHERE sop_uid=?",
                     (pf.sop_uid,),
                 ).fetchone()
+                new_sop = plan.uid_remap[pf.sop_uid]
                 if existing is None:
                     conn.execute(
                         "INSERT INTO instances"
@@ -352,7 +439,7 @@ def process_plan(plan: BatchPlan, batch_id: str) -> None:
                         (
                             pf.sop_uid,
                             pf.sha256,
-                            plan.uid_remap[pf.sop_uid],
+                            new_sop,
                             pf.object_relpath,
                         ),
                     )
@@ -360,6 +447,13 @@ def process_plan(plan: BatchPlan, batch_id: str) -> None:
                     # 并发竞态兜底：另一批次已提交同 SOP 但字节不同
                     raise BatchRejected(
                         f"SOPInstanceUID {pf.sop_uid} 并发提交了不同字节的文件，整批拒绝"
+                    )
+                elif existing["new_sop_uid"] != new_sop:
+                    # 并发竞态兜底：另一批次已发布该实例且新号不同，
+                    # 本批影像与清单将无法自洽，整批拒绝
+                    raise BatchRejected(
+                        f"SOPInstanceUID {pf.sop_uid} 已发布为不同新号，"
+                        f"无法一致完成，整批拒绝"
                     )
                 conn.execute(
                     "INSERT OR IGNORE INTO batch_files(batch_id, sop_uid, orig_name, "
